@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { KilnWindow } from '../types/window'
 
 const SEED_TIME = '2026-09-01T02:00:00.000Z'
 
@@ -27,6 +28,9 @@ export const SEED_IDS = {
   piecePaperweight: 'piece-sunset-weight',
   pieceBottle: 'piece-frost-bottle',
   pieceCup: 'piece-red-cup',
+  windowAnnealAvailable: 'window-an01-available-sep-oct',
+  windowAnnealMaint: 'window-an01-maintenance',
+  windowMeltDown: 'window-kiln01-shutdown',
 } as const
 
 function wrap<T>(row: Omit<T, 'createdAt' | 'updatedAt' | 'revision'>): T {
@@ -83,11 +87,20 @@ export async function seedDatabase(): Promise<void> {
   ]
 
   // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
+  // 排位状态（schedStatus）与物理退火状态（state）分开记账
   const anneals: Anneal[] = [
-    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中' }),
-    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
+    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉', schedStatus: '已排位', schedNote: '' }),
+    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉', schedStatus: '已排位', schedNote: '' }),
+    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中', schedStatus: '已排位', schedNote: '' }),
+    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑', schedStatus: '已排位', schedNote: '' }),
+  ]
+
+  // ---------------- 设备台账：窑炉时段窗口（检修 / 停窑 / 可用） ----------------
+  // 检修与停窑窗口刻意避开既有排位；把它们改到排位时段即可看到排位被退回待排。
+  const kilnWindows: KilnWindow[] = [
+    wrap<KilnWindow>({ id: SEED_IDS.windowAnnealAvailable, furnaceId: SEED_IDS.furnaceAnneal, kind: '可用', startAt: '2026-09-01T00:00', endAt: '2026-10-31T23:59', note: 'AN-01 退火窑 9–10 月常规可用时段，A1–C3 窑位正常承接排位。' }),
+    wrap<KilnWindow>({ id: SEED_IDS.windowAnnealMaint, furnaceId: SEED_IDS.furnaceAnneal, kind: '检修', startAt: '2026-10-10T08:00', endAt: '2026-10-11T18:00', note: '发热元件与温控探头季度检修，全窑停摆。' }),
+    wrap<KilnWindow>({ id: SEED_IDS.windowMeltDown, furnaceId: SEED_IDS.furnaceMelt, kind: '停窑', startAt: '2026-10-15T00:00', endAt: '2026-10-17T00:00', note: '燃气管道改造计划停窑。' }),
   ]
 
   // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------
@@ -97,12 +110,17 @@ export async function seedDatabase(): Promise<void> {
     wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
   ]
 
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await db.furnaces.bulkPut(furnaces)
-    await db.batches.bulkPut(batches)
-    await db.pieces.bulkPut(pieces)
-    await db.steps.bulkPut(steps)
-    await db.anneals.bulkPut(anneals)
-    await db.inspects.bulkPut(inspects)
-  })
+  await db.transaction(
+    'rw',
+    [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.kilnWindows],
+    async () => {
+      await db.furnaces.bulkPut(furnaces)
+      await db.batches.bulkPut(batches)
+      await db.pieces.bulkPut(pieces)
+      await db.steps.bulkPut(steps)
+      await db.anneals.bulkPut(anneals)
+      await db.inspects.bulkPut(inspects)
+      await db.kilnWindows.bulkPut(kilnWindows)
+    },
+  )
 }

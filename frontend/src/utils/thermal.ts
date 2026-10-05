@@ -7,6 +7,8 @@
  */
 import type { Anneal, CurveSeg } from '../types/anneal'
 import type { Craft } from '../types/piece'
+import type { KilnWindow } from '../types/window'
+import { BLOCKING_WINDOW_KINDS } from '../types/window'
 
 /** 保留 1 位小数 */
 export function round1(value: number): number {
@@ -170,6 +172,117 @@ export function kilnSlots(kilnCode: string): string[] {
     })
   })
   return list
+}
+
+/** 从窑位（如 AN-01-A1）解析窑号（AN-01）；解析不出返回空串 */
+export function kilnCodeOfSlot(kilnSlot: string): string {
+  return kilnSlot.split('-').slice(0, -1).join('-')
+}
+
+export interface WindowBlock {
+  blocked: boolean
+  /** 阻断的设备窗口 */
+  windowId: string
+  kind: KilnWindow['kind'] | ''
+  message: string
+}
+
+/**
+ * 设备台账校验：排位时间窗落在该窑炉检修 / 停窑窗口里即不许排。
+ * 只看阻断类窗口（检修 / 停窑），「可用」窗口仅作声明、不参与拦截。
+ * 排位时间窗与窑位判重一致：未出炉时按「入窑 + 该曲线段理论时长」估算临时出炉时刻。
+ * furnaceLabel 用于提示中展示窑号。
+ */
+export function checkWindowBlockById(
+  windows: KilnWindow[],
+  furnaceId: string,
+  candidate: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+  wallThicknessOf: (pieceId: string) => number,
+  furnaceLabel?: string,
+): WindowBlock {
+  const ownWindow = annealWindow(candidate, wallThicknessOf(candidate.pieceId))
+  for (const win of windows) {
+    if (win.furnaceId !== furnaceId) continue
+    if (!BLOCKING_WINDOW_KINDS.includes(win.kind)) continue
+    if (windowsOverlap(ownWindow, [parseAt(win.startAt), parseAt(win.endAt)])) {
+      return {
+        blocked: true,
+        windowId: win.id,
+        kind: win.kind,
+        message: `${furnaceLabel ?? '该窑炉'}在该时段有「${win.kind}」安排（${win.startAt.replace('T', ' ')} 起），落在检修/停窑窗口里的排位不许提交。`,
+      }
+    }
+  }
+  return { blocked: false, windowId: '', kind: '', message: '' }
+}
+
+/** 对账结果：对不上的排位及原因 */
+export interface ReconcileMismatch {
+  annealId: string
+  kilnSlot: string
+  reason: string
+}
+
+/**
+ * 两边按窑炉和时段对账。
+ * - 排位用的窑号在设备台账里查不到窑炉 → 归属对不上；
+ * - 排位时间窗撞进该窑炉的检修 / 停窑窗口 → 时段对不上。
+ * 仅核对「已排位」的记录；待排 / 挂起记录不重复对账。
+ */
+export function reconcilePlacements(
+  anneals: Anneal[],
+  windows: KilnWindow[],
+  furnaceCodeById: Map<string, string>,
+  wallThicknessOf: (pieceId: string) => number,
+): ReconcileMismatch[] {
+  const mismatches: ReconcileMismatch[] = []
+  for (const anneal of anneals) {
+    if (anneal.schedStatus !== '已排位') continue
+    const code = kilnCodeOfSlot(anneal.kilnSlot)
+    const furnaceId = Array.from(furnaceCodeById.entries()).find(([, value]) => value === code)?.[0]
+    if (code === '' || furnaceId === undefined) {
+      mismatches.push({
+        annealId: anneal.id,
+        kilnSlot: anneal.kilnSlot,
+        reason: `排位窑位「${anneal.kilnSlot}」在设备台账里找不到对应窑炉，窑炉归属对不上。`,
+      })
+      continue
+    }
+    const placementWindow = annealWindow(anneal, wallThicknessOf(anneal.pieceId))
+    const hit = windows.find(
+      (win) =>
+        win.furnaceId === furnaceId &&
+        BLOCKING_WINDOW_KINDS.includes(win.kind) &&
+        windowsOverlap(placementWindow, [parseAt(win.startAt), parseAt(win.endAt)]),
+    )
+    if (hit !== undefined) {
+      mismatches.push({
+        annealId: anneal.id,
+        kilnSlot: anneal.kilnSlot,
+        reason: `排位时段撞进 ${code} 的「${hit.kind}」窗口（${hit.startAt.replace('T', ' ')} 起），两边时段对不上。`,
+      })
+    }
+  }
+  return mismatches
+}
+
+/**
+ * 判断某条待排排位在当前设备窗口下是否已可重排（不再撞任何阻断窗口，且窑炉归属存在）。
+ * 返回空串表示可重排；否则返回仍需等待的原因。
+ */
+export function pendingBlockReason(
+  anneal: Anneal,
+  windows: KilnWindow[],
+  furnaceCodeById: Map<string, string>,
+  wallThicknessOf: (pieceId: string) => number,
+): string {
+  const code = kilnCodeOfSlot(anneal.kilnSlot)
+  const furnaceId = Array.from(furnaceCodeById.entries()).find(([, value]) => value === code)?.[0]
+  if (code === '' || furnaceId === undefined) {
+    return `窑位「${anneal.kilnSlot}」仍找不到对应窑炉`
+  }
+  const block = checkWindowBlockById(windows, furnaceId, anneal, wallThicknessOf, code)
+  return block.blocked ? block.message : ''
 }
 
 /** 工艺对应的适宜成型温度区间（℃） */

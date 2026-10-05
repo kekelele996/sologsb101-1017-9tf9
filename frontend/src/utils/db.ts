@@ -1,8 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbglassblow
- * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值
- * - 提供各表增删改查、作品状态联动、整库快照导入导出与重置
+ * - 含数据结构版本号与升级迁移逻辑：v1 → v2 为 Piece 增加 craft 索引并回填默认值；
+ *   v2 → v3 设备台账独立成表（检修/停窑/可用窗口），排位增加排位状态，并为老排位按所用窑炉补全天可用窗口
+ * - 提供各表增删改查、作品状态联动、设备窗口撞窗退回、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie'
@@ -12,17 +13,20 @@ import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { KilnWindow } from '../types/window'
+import { ALL_DAY_END, ALL_DAY_START, BLOCKING_WINDOW_KINDS } from '../types/window'
 import { nowIso } from './id'
+import { annealWindow, parseAt, windowsOverlap } from './thermal'
 import { seedDatabase } from './seed'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -31,6 +35,8 @@ class GlassBlowDatabase extends Dexie {
   steps!: Table<Step, string>
   anneals!: Table<Anneal, string>
   inspects!: Table<Inspect, string>
+  /** 设备台账：检修窗口 / 停窑时段 / 可用时段 */
+  kilnWindows!: Table<KilnWindow, string>
 
   constructor() {
     super(DB_NAME)
@@ -93,6 +99,75 @@ class GlassBlowDatabase extends Dexie {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
         })
       })
+
+    // ---------- v3：设备台账独立成表（检修/停窑/可用窗口），排位增加排位状态 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        // schedStatus 为 v3 新增索引
+        anneals: 'id, pieceId, kilnSlot, state, schedStatus, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+        // 设备台账：按窑炉 + 窗口性质 + 起止时段记账
+        kilnWindows: 'id, furnaceId, kind, startAt, endAt',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：新表补齐行结构修订号
+        await tx.table('kilnWindows').toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION
+          if (typeof row.createdAt !== 'string') row.createdAt = nowIso()
+          if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt
+        })
+        // 迁移 2：历史排位补齐排位状态（默认视为已排位，备注留空）
+        await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.schedStatus !== '已排位' && row.schedStatus !== '待排' && row.schedStatus !== '挂起') {
+            row.schedStatus = '已排位'
+          }
+          if (typeof row.schedNote !== 'string') row.schedNote = ''
+        })
+
+        // 迁移 3：旧排位没记窑炉归属——按它用的窑炉（窑位前缀 = 窑号）补一条
+        // 「当天全天可用」窗口；补不上（找不到对应窑炉）的老排位维持原样，不做改写。
+        const furnaces = await tx.table<Furnace, string>('furnaces').toArray()
+        const anneals = await tx.table<Anneal, string>('anneals').toArray()
+        /** 窑号 → 窑炉 id */
+        const codeToFurnaceId = new Map<string, string>()
+        furnaces.forEach((furnace) => {
+          if (furnace.code !== '') codeToFurnaceId.set(furnace.code, furnace.id)
+        })
+
+        /** 已补过的「窑炉 + 日期」，同一窑同一天只补一条全天可用窗口 */
+        const backfilled = new Set<string>()
+        const stamp = nowIso()
+        const windows: KilnWindow[] = []
+        for (const anneal of anneals) {
+          // 窑位形如 AN-01-A1：去掉最后一段槽位号得到窑号
+          const kilnCode = anneal.kilnSlot.split('-').slice(0, -1).join('-')
+          const furnaceId = kilnCode === '' ? undefined : codeToFurnaceId.get(kilnCode)
+          if (furnaceId === undefined) continue // 补不上的老排位维持原样
+          const day = (anneal.inAt ?? '').slice(0, 10) // YYYY-MM-DD
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
+          const key = `${furnaceId}@${day}`
+          if (backfilled.has(key)) continue
+          backfilled.add(key)
+          windows.push({
+            id: `window-legacy-${furnaceId}-${day}`,
+            furnaceId,
+            kind: '可用',
+            startAt: `${day}${ALL_DAY_START}`,
+            endAt: `${day}${ALL_DAY_END}`,
+            note: '升级迁移：为旧排位按所用窑炉补录的全天可用窗口。',
+            createdAt: stamp,
+            updatedAt: stamp,
+            revision: ROW_REVISION,
+          })
+        }
+        if (windows.length > 0) {
+          await tx.table<KilnWindow, string>('kilnWindows').bulkPut(windows)
+        }
+      })
   }
 }
 
@@ -130,12 +205,95 @@ export async function putFurnace(row: Furnace): Promise<void> {
   await db.furnaces.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
-/** 删除窑炉：级联清理该窑下的料液批次 */
+/** 删除窑炉：级联清理该窑下的料液批次与设备时段窗口 */
 export async function removeFurnace(id: string): Promise<void> {
-  await db.transaction('rw', db.furnaces, db.batches, async () => {
+  await db.transaction('rw', db.furnaces, db.batches, db.kilnWindows, async () => {
     await db.batches.where('furnaceId').equals(id).delete()
+    await db.kilnWindows.where('furnaceId').equals(id).delete()
     await db.furnaces.delete(id)
   })
+}
+
+/* ------------------------ 设备台账：窑炉时段窗口 ------------------------ */
+
+export async function listKilnWindows(): Promise<KilnWindow[]> {
+  const rows = await db.kilnWindows.toArray()
+  return rows.sort((a, b) => a.startAt.localeCompare(b.startAt) || a.endAt.localeCompare(b.endAt))
+}
+
+export async function putKilnWindow(row: KilnWindow): Promise<void> {
+  await db.kilnWindows.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+}
+
+export async function removeKilnWindow(id: string): Promise<void> {
+  await db.kilnWindows.delete(id)
+}
+
+/**
+ * 设备侧写入：独立的重试通道。
+ * 设备台账写入失败后只在设备侧（kilnWindows 表）重试，不触碰排产台账（anneals 表）。
+ * @param attempts 最大尝试次数（含首次）
+ * @param shouldFail 可选的故障注入：返回 true 时本次写入按失败处理（用于演示重试）
+ * @returns 实际尝试次数；全部失败时抛出最后一次错误
+ */
+export async function putKilnWindowWithRetry(
+  row: KilnWindow,
+  attempts = 3,
+  shouldFail?: (attempt: number) => boolean,
+): Promise<{ tries: number }> {
+  let lastError: unknown = null
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (shouldFail?.(attempt)) {
+      lastError = new Error(`设备台账写入失败（第 ${attempt} 次，模拟设备侧故障）`)
+      continue
+    }
+    try {
+      await putKilnWindow(row)
+      return { tries: attempt }
+    } catch (err) {
+      lastError = err
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('设备台账写入失败')
+}
+
+/**
+ * 设备员改了检修 / 停窑窗口后：把已经排上、又撞进该窗口的排位退回「待排」，按新时段重排。
+ * 只改写排产台账（anneals.schedStatus / schedNote），设备那份窗口记录不动。
+ * 仅处理「已排位」记录：待排/挂起记录保持现状，等待各自的处理流程。
+ * 时间窗与排位判重一致：未出炉时按「入窑 + 该曲线段理论时长」估算临时出炉时刻。
+ * @returns 被退回待排的排位 id 列表
+ */
+export async function bumpCollidingAnneals(
+  window: Pick<KilnWindow, 'furnaceId' | 'kind' | 'startAt' | 'endAt' | 'id'>,
+): Promise<string[]> {
+  if (!BLOCKING_WINDOW_KINDS.includes(window.kind)) return []
+
+  const furnace = await db.furnaces.get(window.furnaceId)
+  if (!furnace) return []
+  const slotPrefix = `${furnace.code}-`
+  const blockingWindow: [number, number] = [parseAt(window.startAt), parseAt(window.endAt)]
+
+  const [anneals, pieces] = await Promise.all([db.anneals.toArray(), db.pieces.toArray()])
+  const thicknessOf = (pieceId: string): number =>
+    pieces.find((piece) => piece.id === pieceId)?.wallThicknessMm ?? 4
+
+  const bumped: string[] = []
+  const stamp = nowIso()
+
+  for (const anneal of anneals) {
+    if (anneal.schedStatus !== '已排位') continue
+    if (!anneal.kilnSlot.startsWith(slotPrefix)) continue
+    const placementWindow = annealWindow(anneal, thicknessOf(anneal.pieceId))
+    if (!windowsOverlap(placementWindow, blockingWindow)) continue
+    bumped.push(anneal.id)
+    await db.anneals.update(anneal.id, {
+      schedStatus: '待排',
+      schedNote: `设备侧「${window.kind}」窗口（${window.startAt.replace('T', ' ')} 起）与本排位时间窗重叠，已退回待排，请按新时段重排。`,
+      updatedAt: stamp,
+    })
+  }
+  return bumped
 }
 
 /* ------------------------------ 料液批次 ------------------------------ */
@@ -271,6 +429,18 @@ export async function advanceAnnealState(annealId: string, next: Anneal['state']
   await syncPieceState(row.pieceId)
 }
 
+/**
+ * 只更新排产台账侧的排位状态 / 备注（待排重排、挂起确认），
+ * 不改写物理退火状态与入出炉时刻。
+ */
+export async function setSchedStatus(
+  annealId: string,
+  schedStatus: Anneal['schedStatus'],
+  schedNote: string,
+): Promise<void> {
+  await db.anneals.update(annealId, { schedStatus, schedNote, updatedAt: nowIso() })
+}
+
 /* ------------------------------ 出炉检验 ------------------------------ */
 
 export async function listInspects(): Promise<Inspect[]> {
@@ -307,61 +477,101 @@ export interface DatabaseSnapshot {
   steps: Step[]
   anneals: Anneal[]
   inspects: Inspect[]
+  /** v3 起：设备台账窗口（旧版存档缺省为空数组） */
+  kilnWindows: KilnWindow[]
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [furnaces, batches, pieces, steps, anneals, inspects] = await Promise.all([
+  const [furnaces, batches, pieces, steps, anneals, inspects, kilnWindows] = await Promise.all([
     db.furnaces.toArray(),
     db.batches.toArray(),
     db.pieces.toArray(),
     db.steps.toArray(),
     db.anneals.toArray(),
     db.inspects.toArray(),
+    db.kilnWindows.toArray(),
   ])
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), furnaces, batches, pieces, steps, anneals, inspects }
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    furnaces,
+    batches,
+    pieces,
+    steps,
+    anneals,
+    inspects,
+    kilnWindows,
+  }
+}
+
+/** 兼容旧版（v2 及以前）存档：补齐排位状态与设备窗口表 */
+function normalizeImported(snapshot: DatabaseSnapshot): {
+  anneals: Anneal[]
+  kilnWindows: KilnWindow[]
+} {
+  const anneals = snapshot.anneals.map((row) => ({
+    ...row,
+    schedStatus: row.schedStatus ?? '已排位',
+    schedNote: typeof row.schedNote === 'string' ? row.schedNote : '',
+  }))
+  return { anneals, kilnWindows: Array.isArray(snapshot.kilnWindows) ? snapshot.kilnWindows : [] }
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await Promise.all([
-      db.furnaces.clear(),
-      db.batches.clear(),
-      db.pieces.clear(),
-      db.steps.clear(),
-      db.anneals.clear(),
-      db.inspects.clear(),
-    ])
-    await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
-  })
+  const { anneals, kilnWindows } = normalizeImported(snapshot)
+  await db.transaction(
+    'rw',
+    [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.kilnWindows],
+    async () => {
+      await Promise.all([
+        db.furnaces.clear(),
+        db.batches.clear(),
+        db.pieces.clear(),
+        db.steps.clear(),
+        db.anneals.clear(),
+        db.inspects.clear(),
+        db.kilnWindows.clear(),
+      ])
+      await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.anneals.bulkPut(anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.kilnWindows.bulkPut(kilnWindows.map((row) => ({ ...row, revision: ROW_REVISION })))
+    },
+  )
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await Promise.all([
-      db.furnaces.clear(),
-      db.batches.clear(),
-      db.pieces.clear(),
-      db.steps.clear(),
-      db.anneals.clear(),
-      db.inspects.clear(),
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.kilnWindows],
+    async () => {
+      await Promise.all([
+        db.furnaces.clear(),
+        db.batches.clear(),
+        db.pieces.clear(),
+        db.steps.clear(),
+        db.anneals.clear(),
+        db.inspects.clear(),
+        db.kilnWindows.clear(),
+      ])
+    },
+  )
   await seedDatabase()
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [furnaces, batches, pieces, steps, anneals, inspects] = await Promise.all([
+  const [furnaces, batches, pieces, steps, anneals, inspects, kilnWindows] = await Promise.all([
     db.furnaces.count(),
     db.batches.count(),
     db.pieces.count(),
     db.steps.count(),
     db.anneals.count(),
     db.inspects.count(),
+    db.kilnWindows.count(),
   ])
-  return { furnaces, batches, pieces, steps, anneals, inspects }
+  return { furnaces, batches, pieces, steps, anneals, inspects, kilnWindows }
 }

@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引；`v2 → v3` 设备台账独立成表并为老排位补全天可用窗口 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -69,11 +69,11 @@ sologsb101-1017/
         ├── App.vue             # 外壳：顶部导航 + 当前作品上下文 + 页脚
         ├── env.d.ts
         ├── styles/main.css
-        ├── types/              # furnace.ts batch.ts piece.ts step.ts anneal.ts inspect.ts
-        ├── stores/             # furnaceStore.ts pieceStore.ts annealStore.ts
+        ├── types/              # furnace.ts batch.ts piece.ts step.ts anneal.ts inspect.ts window.ts
+        ├── stores/             # furnaceStore.ts pieceStore.ts annealStore.ts equipmentStore.ts
         ├── components/common/  # StageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
-        ├── pages/              # 5 个模块页面
+        ├── pages/              # 6 个模块页面（含设备台账 EquipmentBoard）
         ├── router/index.ts     # 路由表 + ROUTES 常量
         └── utils/              # thermal.ts db.ts export.ts seed.ts id.ts
 ```
@@ -85,9 +85,10 @@ sologsb101-1017/
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
 | `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
+| `/equipment` | `pages/EquipmentBoard.vue` | **设备台账（设备员记账）**：登记每台窑炉的检修窗口、停窑时段、可用时段；保存检修/停窑窗口后撞窗排位退回待排（设备那份不动）；设备侧写入失败仅设备侧重试 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
-| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
+| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突 / 落在检修停窑窗口均禁用提交**、撞窗退回待排后按新时段重排、按窑炉时段对账挂起、状态流转、出炉回写作品状态 |
 | `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
@@ -100,13 +101,22 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**设备台账与排产台账分账**：
+    * 新表 `kilnWindows`（设备台账）：每台窑炉的检修窗口 / 停窑时段 / 可用时段；
+    * `anneals` 新增排位状态索引 `schedStatus` 与备注 `schedNote`（已排位 / 待排 / 挂起），历史排位统一回填为「已排位」；
+    * **旧排位没记窑炉归属**：升级时按它用的窑炉（窑位前缀＝窑号）补一条「当天全天可用」窗口，同一窑同一天只补一条；**补不上对应窑炉的老排位维持原样**，不做改写。
+* **两本账分账规则**（设备员 `kilnWindows` ／ 排产员 `anneals`）：
+  * 排位前对着设备那份可用时段看：时间窗落在检修 / 停窑窗口里的排位**禁止提交**（可用窗口仅声明、不拦截）；
+  * 设备员改了检修 / 停窑窗口：已排上又撞进去的排位**退回待排**，按新时段重排，**设备那份窗口记录不动**；
+  * 两边按窑炉和时段对账：窑炉归属对不上（窑位前缀查不到窑炉）或时段撞检修/停窑窗口的排位**先挂起等人确认**；
+  * 设备侧写入失败后只在**设备侧重试**（`putKilnWindowWithRetry`，默认 3 次），排产那份不受影响。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,8 +125,9 @@ sologsb101-1017/
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
+  | `anneals` | id | pieceId, kilnSlot, state, **schedStatus**, inAt, curveSeg |
   | `inspects` | id | pieceId, date, result, inspector |
+  | `kilnWindows` | id | furnaceId, kind, startAt, endAt |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
@@ -124,10 +135,11 @@ sologsb101-1017/
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
   * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
   * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
+  * 3 条设备时段窗口（AN-01 一条跨月可用时段 + 一条季度检修、KILN-01 一条停窑；检修/停窑时刻意避开既有排位，改到排位时段即可演示撞窗退回）；
   * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
-* 删除窑炉会级联清理其料液批次；删除作品会级联清理其工序、退火与检验记录（均在同一 Dexie 事务内完成）。
+* 删除窑炉会级联清理其料液批次与设备时段窗口；删除作品会级联清理其工序、退火与检验记录（均在同一 Dexie 事务内完成）。
 
 ---
 
@@ -158,6 +170,12 @@ npm run preview      # 预览 dist 产物
   三段合计即该作品的**理论退火时长**，壁厚直接决定总时长。
 * **窑位占用判重**：同一窑位的时间窗 `[入窑, 出炉]` 重叠即判定冲突；未出炉时以「入窑 + 该曲线段理论时长」作为临时出炉时间参与判重。
   **冲突时提交按钮禁用**并给出冲突的既有记录说明。
+* **设备时段分账（设备台账 vs 排产台账）**：
+  * 设备员在 `/equipment` 维护检修窗口 / 停窑时段 / 可用时段（`kilnWindows`，独立一表）；
+  * 排位前按窑炉归属核对设备窗口：时间窗落在检修 / 停窑窗口（或窑号在设备台账中不存在）时**提交按钮禁用**；
+  * 设备员保存检修 / 停窑窗口后，时间窗撞入的「已排位」记录自动**退回待排**并写明原因，仅改写排产侧、设备窗口不变；
+  * 退火编排页可把待排记录「按新时段重排」（当前窗口已放行即恢复已排位），也可「按窑炉时段对账」把对不上的排位**挂起**，人工在「确认无误 / 退回待排」间裁决；
+  * 设备侧写窗口走独立重试通道（默认 3 次），可用页内「模拟设备写入故障」开关观察前两次失败、第三次成功；重试期间排产台账不被改动。
 * **温度单位换算**：℃ ↔ ℉（`cToF` / `fToC`）。
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。

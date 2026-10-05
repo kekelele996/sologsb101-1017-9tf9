@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Box, DocumentChecked, Odometer, SetUp, Sunrise } from '@element-plus/icons-vue'
+import { Box, DocumentChecked, Odometer, SetUp, Sunrise, Tools } from '@element-plus/icons-vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { useAnnealStore } from '@/stores/annealStore'
+import { useEquipmentStore } from '@/stores/equipmentStore'
 import { ROUTES } from '@/router'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const furnaceStore = useFurnaceStore()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
+const equipmentStore = useEquipmentStore()
 
 const navItems = computed(() => {
   const currentPieceId = pieceStore.currentPieceId
   return [
     { path: ROUTES.furnaces, label: '窑炉料液', icon: SetUp, badge: String(furnaceStore.furnaces.length) },
+    { path: ROUTES.equipment, label: '设备时段', icon: Tools, badge: String(equipmentStore.windows.length) },
     { path: ROUTES.pieces, label: '作品登记', icon: Box, badge: String(pieceStore.pieces.length) },
     {
       path: currentPieceId ? ROUTES.steps(currentPieceId) : ROUTES.pieces,
@@ -43,9 +46,12 @@ const activePath = computed<string>(() => {
 })
 
 const lowRemain = computed<number>(() => furnaceStore.lowRemainBatches.length)
+const pendingPlacements = computed<number>(() => annealStore.pendingCount)
+const suspendedPlacements = computed<number>(() => annealStore.suspendedCount)
 
 onMounted(() => {
   void furnaceStore.loadAll()
+  void equipmentStore.loadAll()
   void pieceStore.loadAll()
   void annealStore.loadAll()
 })
@@ -86,6 +92,8 @@ function go(path: string): void {
         </el-tag>
         <el-tag v-else type="info">未选择作品</el-tag>
         <el-tag v-if="lowRemain > 0" type="danger" effect="dark">待补料 {{ lowRemain }} 批</el-tag>
+        <el-tag v-if="pendingPlacements > 0" type="warning" effect="dark">排位待排 {{ pendingPlacements }} 条</el-tag>
+        <el-tag v-if="suspendedPlacements > 0" type="danger" effect="dark">对账挂起 {{ suspendedPlacements }} 条</el-tag>
       </div>
     </header>
 

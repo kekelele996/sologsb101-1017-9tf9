@@ -7,6 +7,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 /** 路由路径常量：全项目唯一来源，避免手写字符串不一致 */
 export const ROUTES = {
   furnaces: '/furnaces',
+  equipment: '/equipment',
   pieces: '/pieces',
   steps: (pieceId: string): string => `/pieces/${pieceId}/steps`,
   annealing: '/annealing',
@@ -20,6 +21,12 @@ const routes: RouteRecordRaw[] = [
     name: 'furnace-list',
     component: () => import('@/pages/FurnaceList.vue'),
     meta: { title: '窑炉与料液台账' },
+  },
+  {
+    path: '/equipment',
+    name: 'equipment-board',
+    component: () => import('@/pages/EquipmentBoard.vue'),
+    meta: { title: '窑炉检修与可用时段（设备台账）' },
   },
   {
     path: '/pieces',

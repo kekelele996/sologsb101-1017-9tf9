@@ -73,7 +73,16 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  // v3 起新增 kilnWindows：旧版存档缺省时按空数组补齐（设备台账从空开始）
+  const snapshot = data as DatabaseSnapshot
+  if (!Array.isArray(snapshot.kilnWindows)) snapshot.kilnWindows = []
+  // 旧版排位没有排位状态，归一为已排位，避免导入后无法显示
+  snapshot.anneals = snapshot.anneals.map((row) => ({
+    ...row,
+    schedStatus: row.schedStatus ?? '已排位',
+    schedNote: typeof row.schedNote === 'string' ? row.schedNote : '',
+  }))
+  return { ok: true, message: '存档校验通过。', snapshot }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
