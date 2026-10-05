@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Box, DocumentChecked, Odometer, SetUp, Sunrise } from '@element-plus/icons-vue'
+import { Box, DocumentChecked, Odometer, SetUp, Sunrise, Tools } from '@element-plus/icons-vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { useAnnealStore } from '@/stores/annealStore'
+import { useDeviceStore } from '@/stores/deviceStore'
 import { ROUTES } from '@/router'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const furnaceStore = useFurnaceStore()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
+const deviceStore = useDeviceStore()
 
 const navItems = computed(() => {
   const currentPieceId = pieceStore.currentPieceId
   return [
     { path: ROUTES.furnaces, label: '窑炉料液', icon: SetUp, badge: String(furnaceStore.furnaces.length) },
+    { path: ROUTES.devices, label: '设备窗口', icon: Tools, badge: String(deviceStore.windows.length), alert: deviceStore.failedCount },
     { path: ROUTES.pieces, label: '作品登记', icon: Box, badge: String(pieceStore.pieces.length) },
     {
       path: currentPieceId ? ROUTES.steps(currentPieceId) : ROUTES.pieces,
@@ -29,7 +32,7 @@ const navItems = computed(() => {
       badge: String(pieceStore.steps.length),
       disabled: currentPieceId === null,
     },
-    { path: ROUTES.annealing, label: '退火编排', icon: Sunrise, badge: String(annealStore.anneals.length) },
+    { path: ROUTES.annealing, label: '退火编排', icon: Sunrise, badge: String(annealStore.anneals.length), alert: annealStore.heldAnneals.length + annealStore.pendingAnneals.length },
     { path: ROUTES.export, label: '检验归档', icon: DocumentChecked, badge: String(pieceStore.counts.inspects ?? 0) },
   ]
 })
@@ -48,6 +51,7 @@ onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
   void annealStore.loadAll()
+  void deviceStore.loadAll()
 })
 
 function go(path: string): void {
@@ -77,7 +81,8 @@ function go(path: string): void {
         >
           <el-icon><component :is="item.icon" /></el-icon>
           <span>{{ item.label }}</span>
-          <em v-if="item.badge !== '0'" class="app-nav__badge">{{ item.badge }}</em>
+          <em v-if="item.alert" class="app-nav__alert">{{ item.alert }}</em>
+          <em v-else-if="item.badge !== '0'" class="app-nav__badge">{{ item.badge }}</em>
         </button>
       </nav>
       <div class="app-header__meta">
@@ -85,6 +90,15 @@ function go(path: string): void {
           当前作品：{{ pieceStore.currentPiece.name }}（{{ pieceStore.currentPiece.state }}）
         </el-tag>
         <el-tag v-else type="info">未选择作品</el-tag>
+        <el-tag v-if="annealStore.pendingAnneals.length > 0" type="warning" effect="dark">
+          退回待排 {{ annealStore.pendingAnneals.length }} 条
+        </el-tag>
+        <el-tag v-if="annealStore.heldAnneals.length > 0" type="danger" effect="dark">
+          挂起待确认 {{ annealStore.heldAnneals.length }} 条
+        </el-tag>
+        <el-tag v-if="deviceStore.failedCount > 0" type="danger" effect="dark">
+          设备侧重试 {{ deviceStore.failedCount }} 条
+        </el-tag>
         <el-tag v-if="lowRemain > 0" type="danger" effect="dark">待补料 {{ lowRemain }} 批</el-tag>
       </div>
     </header>
@@ -98,7 +112,8 @@ function go(path: string): void {
     <footer class="app-footer">
       <span>数据仅存于本浏览器（IndexedDB 库名 gbglassblow / localStorage），不上传任何服务器。</span>
       <span>
-        窑炉 {{ furnaceStore.furnaces.length }} · 料液 {{ furnaceStore.batches.length }} · 作品
+        窑炉 {{ furnaceStore.furnaces.length }} · 设备窗口 {{ deviceStore.windows.length }} · 料液
+        {{ furnaceStore.batches.length }} · 作品
         {{ pieceStore.pieces.length }} · 工序 {{ pieceStore.steps.length }} · 结构版本 v{{
           furnaceStore.counts.schemaVersion ?? '-'
         }}
@@ -197,6 +212,16 @@ function go(path: string): void {
   padding: 0 6px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.18);
+}
+
+.app-nav__alert {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: #c0392b;
+  color: #fff;
 }
 
 .app-header__meta {

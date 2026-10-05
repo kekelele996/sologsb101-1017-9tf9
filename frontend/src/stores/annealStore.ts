@@ -8,6 +8,7 @@ import { liveQuery } from 'dexie'
 import type { Anneal, AnnealDraft, AnnealState, CurveSeg } from '../types/anneal'
 import { ANNEAL_STATE_FLOW } from '../types/anneal'
 import type { Piece } from '../types/piece'
+import type { DeviceWindow } from '../types/deviceWindow'
 import {
   ROW_REVISION,
   advanceAnnealState,
@@ -15,6 +16,9 @@ import {
   initDatabase,
   putAnneal,
   removeAnneal,
+  repairAnnealScheduleState,
+  resetAnnealSchedule,
+  resolveAnnealSchedule,
 } from '../utils/db'
 import {
   checkSlotConflict,
@@ -24,6 +28,7 @@ import {
   totalAnnealHours,
   type SlotConflict,
 } from '../utils/thermal'
+import { checkDeviceWindowConflict, kilnCodeOfSlot, type DeviceConflict } from '../utils/reconcile'
 import { nowIso, nowLocalInput, uuid } from '../utils/id'
 
 /** 退火筛选条件 */
@@ -55,12 +60,23 @@ let subscribed = false
 export const useAnnealStore = defineStore('anneal', () => {
   const anneals = ref<Anneal[]>([])
   const pieces = ref<Piece[]>([])
+  const deviceWindows = ref<DeviceWindow[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
   const lastMessage = ref('')
   const revision = ref(0)
   const filters = reactive<AnnealFilters>({ ...EMPTY_FILTERS })
+
+  /** 已写入设备台账、参与排位校验的设备窗口 */
+  const committedDeviceWindows = computed<DeviceWindow[]>(() =>
+    deviceWindows.value.filter((row) => row.writeState === 'written'),
+  )
+
+  /** 待重排（被设备窗口顶回）的排位 */
+  const pendingAnneals = computed<Anneal[]>(() => anneals.value.filter((row) => row.scheduleState === '待排'))
+  /** 挂起等人工确认的排位 */
+  const heldAnneals = computed<Anneal[]>(() => anneals.value.filter((row) => row.scheduleState === '挂起'))
 
   const kilnCodes = computed<string[]>(() => {
     const set = new Set<string>()
@@ -129,6 +145,18 @@ export const useAnnealStore = defineStore('anneal', () => {
     return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id)
   }
 
+  /** 某条候选排位与设备侧检修/停窑窗口的冲突检测（排位前看设备那份可用时段） */
+  function deviceConflictOf(
+    candidate: Pick<Anneal, 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId' | 'furnaceCode'>,
+  ): DeviceConflict {
+    const code = candidate.furnaceCode || kilnCodeOfSlot(candidate.kilnSlot)
+    return checkDeviceWindowConflict(
+      { ...candidate, furnaceCode: code },
+      wallThicknessOf(candidate.pieceId),
+      committedDeviceWindows.value,
+    )
+  }
+
   /** 某件作品的退火时长汇总 */
   function durationOf(pieceId: string): { hours: number; text: string } {
     const thickness = wallThicknessOf(pieceId)
@@ -144,12 +172,17 @@ export const useAnnealStore = defineStore('anneal', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [annealRows, pieceRows] = await Promise.all([db.anneals.toArray(), db.pieces.toArray()])
-          return { annealRows, pieceRows }
+          const [annealRows, pieceRows, windowRows] = await Promise.all([
+            db.anneals.toArray(),
+            db.pieces.toArray(),
+            db.deviceWindows.toArray(),
+          ])
+          return { annealRows, pieceRows, windowRows }
         }).subscribe({
-          next: ({ annealRows, pieceRows }) => {
+          next: ({ annealRows, pieceRows, windowRows }) => {
             anneals.value = [...annealRows].sort((a, b) => a.inAt.localeCompare(b.inAt))
             pieces.value = pieceRows
+            deviceWindows.value = windowRows
             loading.value = false
             ready.value = true
             error.value = ''
@@ -175,7 +208,8 @@ export const useAnnealStore = defineStore('anneal', () => {
   }
 
   async function createAnneal(draft: AnnealDraft): Promise<Anneal | null> {
-    const conflict = conflictOf({
+    const furnaceCode = kilnCodeOfSlot(draft.kilnSlot)
+    const slotConflict = conflictOf({
       id: '',
       kilnSlot: draft.kilnSlot,
       inAt: draft.inAt,
@@ -183,8 +217,20 @@ export const useAnnealStore = defineStore('anneal', () => {
       curveSeg: draft.curveSeg,
       pieceId: draft.pieceId,
     })
-    if (conflict.conflict) {
-      lastMessage.value = conflict.message
+    if (slotConflict.conflict) {
+      lastMessage.value = slotConflict.message
+      return null
+    }
+    const deviceConflict = deviceConflictOf({
+      kilnSlot: draft.kilnSlot,
+      inAt: draft.inAt,
+      outAt: draft.outAt,
+      curveSeg: draft.curveSeg,
+      pieceId: draft.pieceId,
+      furnaceCode,
+    })
+    if (deviceConflict.conflict) {
+      lastMessage.value = deviceConflict.message
       return null
     }
     const stamp = nowIso()
@@ -196,6 +242,9 @@ export const useAnnealStore = defineStore('anneal', () => {
       inAt: draft.inAt,
       outAt: draft.outAt,
       state: draft.state,
+      scheduleState: '已排',
+      furnaceCode,
+      scheduleNote: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -206,8 +255,9 @@ export const useAnnealStore = defineStore('anneal', () => {
     return row
   }
 
-  async function updateAnneal(annealId: string, draft: AnnealDraft): Promise<boolean> {
-    const conflict = conflictOf({
+  async function updateAnneal(annealId: string, draft: AnnealDraft): Promise<Anneal | null> {
+    const furnaceCode = kilnCodeOfSlot(draft.kilnSlot)
+    const slotConflict = conflictOf({
       id: annealId,
       kilnSlot: draft.kilnSlot,
       inAt: draft.inAt,
@@ -215,13 +265,25 @@ export const useAnnealStore = defineStore('anneal', () => {
       curveSeg: draft.curveSeg,
       pieceId: draft.pieceId,
     })
-    if (conflict.conflict) {
-      lastMessage.value = conflict.message
-      return false
+    if (slotConflict.conflict) {
+      lastMessage.value = slotConflict.message
+      return null
+    }
+    const deviceConflict = deviceConflictOf({
+      kilnSlot: draft.kilnSlot,
+      inAt: draft.inAt,
+      outAt: draft.outAt,
+      curveSeg: draft.curveSeg,
+      pieceId: draft.pieceId,
+      furnaceCode,
+    })
+    if (deviceConflict.conflict) {
+      lastMessage.value = deviceConflict.message
+      return null
     }
     const existing = anneals.value.find((row) => row.id === annealId)
-    if (existing === undefined) return false
-    await putAnneal({
+    if (existing === undefined) return null
+    const updated: Anneal = {
       ...existing,
       pieceId: draft.pieceId,
       kilnSlot: draft.kilnSlot,
@@ -229,10 +291,15 @@ export const useAnnealStore = defineStore('anneal', () => {
       inAt: draft.inAt,
       outAt: draft.outAt,
       state: draft.state,
-    })
+      furnaceCode,
+      // 改好时段重新提交即恢复为已排（待排/挂起排位经此重排）
+      scheduleState: '已排',
+      scheduleNote: existing.scheduleState === '已排' ? existing.scheduleNote : '已按设备侧新时段重新排位。',
+    }
+    await putAnneal(updated)
     revision.value += 1
     lastMessage.value = '退火编排已更新'
-    return true
+    return updated
   }
 
   async function deleteAnneal(annealId: string): Promise<void> {
@@ -255,9 +322,50 @@ export const useAnnealStore = defineStore('anneal', () => {
     return next
   }
 
+  /** 把挂起排位退回待排（人工选择改期重排） */
+  async function sendBackToPending(annealId: string, note = '人工确认后退回待排，按新时段重排。'): Promise<void> {
+    await resetAnnealSchedule([annealId], note)
+    revision.value += 1
+    lastMessage.value = '已退回待排，请改时段后重新排位。'
+  }
+
+  /** 人工确认维持挂起排位原时段，恢复为已排 */
+  async function keepScheduled(annealId: string, note = '人工确认维持原排位。'): Promise<void> {
+    await resolveAnnealSchedule([annealId], note)
+    revision.value += 1
+    lastMessage.value = '该排位已恢复为已排。'
+  }
+
+  /** 待排排位改好时段后一键确认重新入排 */
+  async function confirmReschedule(annealId: string): Promise<boolean> {
+    const existing = anneals.value.find((row) => row.id === annealId)
+    if (existing === undefined) return false
+    const furnaceCode = existing.furnaceCode || kilnCodeOfSlot(existing.kilnSlot)
+    const deviceConflict = deviceConflictOf({
+      kilnSlot: existing.kilnSlot,
+      inAt: existing.inAt,
+      outAt: existing.outAt,
+      curveSeg: existing.curveSeg,
+      pieceId: existing.pieceId,
+      furnaceCode,
+    })
+    if (deviceConflict.conflict) {
+      lastMessage.value = deviceConflict.message
+      return false
+    }
+    await repairAnnealScheduleState([annealId], '已按设备侧新时段重新排位。')
+    revision.value += 1
+    lastMessage.value = '排位已恢复为已排。'
+    return true
+  }
+
   return {
     anneals,
     pieces,
+    deviceWindows,
+    committedDeviceWindows,
+    pendingAnneals,
+    heldAnneals,
     loading,
     ready,
     error,
@@ -272,6 +380,7 @@ export const useAnnealStore = defineStore('anneal', () => {
     visibleAnneals,
     wallThicknessOf,
     conflictOf,
+    deviceConflictOf,
     durationOf,
     loadAll,
     setFilters,
@@ -280,5 +389,8 @@ export const useAnnealStore = defineStore('anneal', () => {
     updateAnneal,
     deleteAnneal,
     advance,
+    sendBackToPending,
+    keepScheduled,
+    confirmReschedule,
   }
 })

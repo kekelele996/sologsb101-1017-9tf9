@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { DeviceWindow, DeviceWriteOp } from '../types/deviceWindow'
 
 const SEED_TIME = '2026-09-01T02:00:00.000Z'
 
@@ -82,12 +83,49 @@ export async function seedDatabase(): Promise<void> {
     wrap<Step>({ id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' }),
   ]
 
-  // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
+  // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑；排位均归属 AN-01） ----------------
   const anneals: Anneal[] = [
-    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中' }),
-    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
+    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉', scheduleState: '已排', furnaceCode: 'AN-01', scheduleNote: '' }),
+    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉', scheduleState: '已排', furnaceCode: 'AN-01', scheduleNote: '' }),
+    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中', scheduleState: '已排', furnaceCode: 'AN-01', scheduleNote: '' }),
+    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑', scheduleState: '已排', furnaceCode: 'AN-01', scheduleNote: '' }),
+  ]
+
+  // ---------------- 设备侧台账（设备员记账；可用/检修/停窑，时段均不与上面排位相撞） ----------------
+  const deviceWindows: DeviceWindow[] = [
+    wrap<DeviceWindow>({ id: 'devicewin-an01-avail-1001', furnaceCode: 'AN-01', kind: '可用', localDate: '2026-10-01', startAt: '', endAt: '', allDay: true, note: '节后全天可排产', writeState: 'written', lastError: '', attempts: 0 }),
+    wrap<DeviceWindow>({ id: 'devicewin-an01-maint-1008', furnaceCode: 'AN-01', kind: '检修', localDate: '2026-10-08', startAt: '', endAt: '', allDay: true, note: '加热元件季度检修，全天禁止入窑', writeState: 'written', lastError: '', attempts: 0 }),
+    wrap<DeviceWindow>({ id: 'devicewin-k01-stop-1010', furnaceCode: 'KILN-01', kind: '停窑', localDate: '2026-10-10', startAt: '', endAt: '', allDay: true, note: '燃气管道改造停窑', writeState: 'written', lastError: '', attempts: 0 }),
+    wrap<DeviceWindow>({ id: 'devicewin-an01-avail-1012', furnaceCode: 'AN-01', kind: '可用', localDate: '2026-10-12', startAt: '08:00', endAt: '20:00', allDay: false, note: '白班可用时段', writeState: 'written', lastError: '', attempts: 0 }),
+  ]
+
+  // ---------------- 设备侧重试队列（一条写入失败待重试的检修窗口，排产侧不受影响） ----------------
+  const failedWindow: DeviceWindow = wrap<DeviceWindow>({
+    id: 'devicewin-an01-maint-1015',
+    furnaceCode: 'AN-01',
+    kind: '检修',
+    localDate: '2026-10-15',
+    startAt: '',
+    endAt: '',
+    allDay: true,
+    note: '温控探头校准（写入失败，待设备侧重试）',
+    writeState: 'failed',
+    lastError: '设备侧台账写入失败（模拟）：设备系统暂不可用，已进入设备侧重试队列，排产侧不受影响。',
+    attempts: 1,
+  })
+  const deviceOutbox: DeviceWriteOp[] = [
+    {
+      id: 'devop-seed-failed-1',
+      opKind: 'put',
+      window: failedWindow,
+      windowId: failedWindow.id,
+      state: 'failed',
+      attempts: 1,
+      lastError: failedWindow.lastError,
+      failOnce: false,
+      createdAt: SEED_TIME,
+      updatedAt: SEED_TIME,
+    },
   ]
 
   // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------
@@ -97,12 +135,14 @@ export async function seedDatabase(): Promise<void> {
     wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
   ]
 
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
+  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.deviceWindows, db.deviceOutbox], async () => {
     await db.furnaces.bulkPut(furnaces)
     await db.batches.bulkPut(batches)
     await db.pieces.bulkPut(pieces)
     await db.steps.bulkPut(steps)
     await db.anneals.bulkPut(anneals)
     await db.inspects.bulkPut(inspects)
+    await db.deviceWindows.bulkPut(deviceWindows)
+    await db.deviceOutbox.bulkPut(deviceOutbox)
   })
 }

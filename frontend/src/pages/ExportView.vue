@@ -81,6 +81,8 @@ const stats = computed(() => {
     passPct: total === 0 ? 0 : Math.round((pass / total) * 1000) / 10,
     inProgress: pieceStore.pieces.filter((row) => row.state === '设计中' || row.state === '制作中').length,
     occupancyRate: annealStore.occupancyRate,
+    pending: annealStore.pendingAnneals.length,
+    held: annealStore.heldAnneals.length,
   }
 })
 
@@ -209,6 +211,20 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
       <StatBadge label="合格率" :value="`${stats.passPct}%`" :percent="stats.passPct" tone="success" icon="PieChart" />
       <StatBadge label="在制件数" :value="stats.inProgress" suffix="件" tone="warning" icon="TrendCharts" />
       <StatBadge
+        label="退回待排"
+        :value="stats.pending"
+        suffix="条"
+        :tone="stats.pending > 0 ? 'danger' : 'info'"
+        icon="Warning"
+      />
+      <StatBadge
+        label="挂起待确认"
+        :value="stats.held"
+        suffix="条"
+        :tone="stats.held > 0 ? 'danger' : 'success'"
+        icon="Warning"
+      />
+      <StatBadge
         label="窑位占用率"
         :value="`${stats.occupancyRate}%`"
         :percent="stats.occupancyRate"
@@ -221,7 +237,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 拆分设备侧台账（检修/停窑/可用窗口与重试队列）并为排位补窑炉归属与排位状态"
       />
     </div>
 

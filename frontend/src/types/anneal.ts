@@ -9,6 +9,23 @@ export type CurveSeg = '升温' | '保温' | '缓冷'
 /** 退火状态：待入窑 / 退火中 / 已出炉 */
 export type AnnealState = '待入窑' | '退火中' | '已出炉'
 
+/**
+ * 排位记账状态（排产侧，与退火工艺状态 state 分开）：
+ * - 待排：尚未排上，或被设备侧检修窗口变更顶回，等待按新时段重排；
+ * - 已排：排位有效，入窑/出炉时段当前不撞任何检修窗口；
+ * - 挂起：按窑炉和时段与设备侧对账对不上，先挂起等人确认。
+ */
+export type ScheduleState = '待排' | '已排' | '挂起'
+
+export const SCHEDULE_STATE_OPTIONS: ScheduleState[] = ['待排', '已排', '挂起']
+
+/** 排位被退回 / 挂起的原因说明（排产侧记账） */
+export const SCHEDULE_STATE_LABEL: Record<ScheduleState, string> = {
+  待排: '待排',
+  已排: '已排',
+  挂起: '挂起',
+}
+
 export const CURVE_SEG_OPTIONS: CurveSeg[] = ['升温', '保温', '缓冷']
 export const ANNEAL_STATE_OPTIONS: AnnealState[] = ['待入窑', '退火中', '已出炉']
 
@@ -29,6 +46,12 @@ export interface Anneal {
   outAt: string
   /** 退火状态 */
   state: AnnealState
+  /** 排位记账状态（排产侧）：待排 / 已排 / 挂起 */
+  scheduleState: ScheduleState
+  /** 排位所属退火窑号（窑号前缀，如 AN-01），旧数据升级时由窑位号回填 */
+  furnaceCode: string
+  /** 被设备侧检修/停窑窗口顶回，或对账挂起时的原因 */
+  scheduleNote: string
   createdAt: string
   updatedAt: string
   revision: number

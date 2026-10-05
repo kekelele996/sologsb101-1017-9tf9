@@ -73,7 +73,11 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  // v3 起新增 deviceWindows / deviceOutbox；旧 v2 存档没有这两列，按空数组合法导入
+  const snapshot = data as DatabaseSnapshot
+  if (!Array.isArray(snapshot.deviceWindows)) snapshot.deviceWindows = []
+  if (!Array.isArray(snapshot.deviceOutbox)) snapshot.deviceOutbox = []
+  return { ok: true, message: '存档校验通过。', snapshot }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -99,7 +103,10 @@ export function buildScheduleCsv(
     '累计工时(分钟)',
     '退火记录数',
     '退火窑位',
+    '退火窑号',
     '退火状态',
+    '排位状态',
+    '排位备注',
     '理论退火时长',
     '检验次数',
     '最近检验结果',
@@ -128,7 +135,10 @@ export function buildScheduleCsv(
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
         latestAnneal?.kilnSlot ?? '—',
+        latestAnneal?.furnaceCode ?? '—',
         latestAnneal?.state ?? '—',
+        latestAnneal?.scheduleState ?? '—',
+        latestAnneal?.scheduleNote ?? '',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
         pieceInspects.length,
         latestInspect?.result ?? '—',
@@ -200,7 +210,9 @@ export function buildStepCardText(
   if (anneals.length > 0) {
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      lines.push(
+        `  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state} · 排位${row.scheduleState}`,
+      )
     })
   }
   return lines.join('\n')

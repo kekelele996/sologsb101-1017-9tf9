@@ -13,13 +13,15 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg } from '@/types/anneal'
+import { useDeviceStore } from '@/stores/deviceStore'
+import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg, type ScheduleState } from '@/types/anneal'
 import { ANNEAL_CURVE, formatHours, segmentHours, totalAnnealHours } from '@/utils/thermal'
 import { nowLocalInput } from '@/utils/id'
 
 const annealStore = useAnnealStore()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const deviceStore = useDeviceStore()
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -72,6 +74,21 @@ const conflict = computed(() =>
   })
 )
 
+/** 当前表单的设备侧检修/停窑窗口冲突，落入窗口的排位不许提交 */
+const deviceConflict = computed(() =>
+  annealStore.deviceConflictOf({
+    kilnSlot: form.kilnSlot,
+    inAt: form.inAt,
+    outAt: form.outAt,
+    curveSeg: form.curveSeg,
+    pieceId: form.pieceId,
+    furnaceCode: '',
+  })
+)
+
+/** 表单是否可提交：窑位占用与设备检修窗口都不冲突 */
+const formBlocked = computed<boolean>(() => conflict.value.conflict || deviceConflict.value.conflict)
+
 const formDuration = computed(() => {
   const piece = pieceStore.pieces.find((row) => row.id === form.pieceId)
   const thickness = piece?.wallThicknessMm ?? 4
@@ -87,12 +104,15 @@ const stats = computed(() => ({
   waiting: annealStore.anneals.filter((row) => row.state === '待入窑').length,
   firing: annealStore.anneals.filter((row) => row.state === '退火中').length,
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
+  pending: annealStore.pendingAnneals.length,
+  held: annealStore.heldAnneals.length,
 }))
 
 onMounted(() => {
   void annealStore.loadAll()
   void pieceStore.loadAll()
   void furnaceStore.loadAll()
+  void deviceStore.loadAll()
 })
 
 function openCreate(): void {
@@ -129,6 +149,10 @@ async function handleSubmit(): Promise<void> {
     ElMessage.error(conflict.value.message)
     return
   }
+  if (deviceConflict.value.conflict) {
+    ElMessage.error(deviceConflict.value.message)
+    return
+  }
   submitting.value = true
   try {
     if (editingId.value === null) {
@@ -139,12 +163,12 @@ async function handleSubmit(): Promise<void> {
       }
       ElMessage.success(`已分配窑位 ${row.kilnSlot}`)
     } else {
-      const ok = await annealStore.updateAnneal(editingId.value, { ...form })
-      if (!ok) {
+      const row = await annealStore.updateAnneal(editingId.value, { ...form })
+      if (row === null) {
         ElMessage.error(annealStore.lastMessage)
         return
       }
-      ElMessage.success('退火编排已更新')
+      ElMessage.success('退火编排已更新（排位恢复为已排）')
     }
     dialogVisible.value = false
   } finally {
@@ -179,6 +203,36 @@ function handleFilterChange(key: string, value: string): void {
   if (key === 'state') annealStore.setFilters({ state: value as AnnealState | 'all' })
   if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
   if (key === 'kilnCode') annealStore.setFilters({ kilnCode: value })
+  if (key === 'schedule') scheduleFilter.value = value as ScheduleState | 'all'
+}
+
+const scheduleFilter = ref<ScheduleState | 'all'>('all')
+
+/** 排位记账状态筛选（待排 / 已排 / 挂起）叠加在既有筛选之上 */
+const tableRows = computed<Anneal[]>(() =>
+  scheduleFilter.value === 'all'
+    ? annealStore.visibleAnneals
+    : annealStore.visibleAnneals.filter((row) => row.scheduleState === scheduleFilter.value)
+)
+
+const scheduleTagType = (state: ScheduleState): 'success' | 'warning' | 'danger' =>
+  state === '已排' ? 'success' : state === '待排' ? 'warning' : 'danger'
+
+async function handleConfirmReschedule(row: Anneal): Promise<void> {
+  const ok = await annealStore.confirmReschedule(row.id)
+  if (ok) ElMessage.success(annealStore.lastMessage)
+  else ElMessage.error(annealStore.lastMessage)
+}
+
+async function handleKeep(row: Anneal): Promise<void> {
+  await annealStore.keepScheduled(row.id)
+  ElMessage.success(annealStore.lastMessage)
+}
+
+function annealRowClass({ row }: { row: Anneal }): string {
+  if (row.scheduleState === '挂起') return 'row-held'
+  if (row.scheduleState === '待排') return 'row-pending'
+  return ''
 }
 </script>
 
@@ -190,6 +244,22 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="退火中" :value="stats.firing" suffix="条" tone="warning" icon="TrendCharts" />
       <StatBadge label="已出炉" :value="stats.done" suffix="条" tone="success" icon="PieChart" />
       <StatBadge
+        label="退回待排"
+        :value="stats.pending"
+        suffix="条"
+        :tone="stats.pending > 0 ? 'danger' : 'info'"
+        icon="Warning"
+        hint="设备员改了检修窗口后，撞进去的排位退回待排，需按新时段重排"
+      />
+      <StatBadge
+        label="挂起待确认"
+        :value="stats.held"
+        suffix="条"
+        :tone="stats.held > 0 ? 'danger' : 'success'"
+        icon="Warning"
+        hint="两边按窑炉和时段对账对不上的排位，先挂起等人确认"
+      />
+      <StatBadge
         label="窑位占用率"
         :value="`${annealStore.occupancyRate}%`"
         :percent="annealStore.occupancyRate"
@@ -200,7 +270,24 @@ function handleFilterChange(key: string, value: string): void {
     </div>
 
     <el-alert
-      v-if="annealStore.lastMessage !== ''"
+      v-if="stats.pending > 0"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${stats.pending} 条排位被设备侧检修/停窑窗口变更顶回待排，请按新时段重排（设备那份窗口未改动）。`"
+    />
+    <el-alert
+      v-if="stats.held > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${stats.held} 条排位与设备侧账目对不上已挂起，等待人工确认（可在「设备窗口」页统一处理）。`"
+    />
+
+    <el-alert
+      v-if="annealStore.lastMessage !== '' && stats.pending === 0 && stats.held === 0"
       type="info"
       show-icon
       :closable="false"
@@ -225,16 +312,23 @@ function handleFilterChange(key: string, value: string): void {
           { key: 'state', label: '退火状态', options: ANNEAL_STATE_OPTIONS as unknown as string[] },
           { key: 'curveSeg', label: '曲线段', options: CURVE_SEG_OPTIONS as unknown as string[] },
           { key: 'kilnCode', label: '退火窑', options: annealStore.kilnCodes },
+          { key: 'schedule', label: '排位状态', options: ['待排', '已排', '挂起'] },
         ]"
         :values="{
           state: annealStore.filters.state,
           curveSeg: annealStore.filters.curveSeg,
           kilnCode: annealStore.filters.kilnCode,
+          schedule: scheduleFilter,
         }"
-        :result-text="`命中 ${annealStore.visibleAnneals.length} / ${annealStore.anneals.length} 条`"
+        :result-text="`命中 ${tableRows.length} / ${annealStore.anneals.length} 条`"
         @update:keyword="(value: string) => annealStore.setFilters({ keyword: value })"
         @change="handleFilterChange"
-        @reset="annealStore.resetFilters()"
+        @reset="
+          () => {
+            annealStore.resetFilters()
+            scheduleFilter = 'all'
+          }
+        "
       />
 
       <EmptyPanel
@@ -245,7 +339,7 @@ function handleFilterChange(key: string, value: string): void {
         @action="openCreate"
       />
 
-      <el-table v-else v-loading="!annealStore.ready" :data="annealStore.visibleAnneals" row-key="id" stripe>
+      <el-table v-else v-loading="!annealStore.ready" :data="tableRows" row-key="id" stripe :row-class-name="annealRowClass">
         <el-table-column label="作品" min-width="190">
           <template #default="{ row }">
             <div class="cell-stack">
@@ -300,12 +394,43 @@ function handleFilterChange(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="排位状态" width="120">
+          <template #default="{ row }">
+            <el-tag size="small" :type="scheduleTagType(row.scheduleState)" effect="plain">
+              {{ row.scheduleState }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="退回 / 挂起原因" min-width="220">
+          <template #default="{ row }">
+            <span v-if="row.scheduleNote === ''" class="cell-sub">—</span>
+            <el-tooltip v-else :content="row.scheduleNote" placement="top" :show-after="200">
+              <span :class="{ 'cell-warn': row.scheduleState !== '已排' }" class="cell-note">{{ row.scheduleNote }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" :disabled="row.state === '已出炉'" @click="handleAdvance(row)">
               推进状态
             </el-button>
-            <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+            <el-button
+              v-if="row.scheduleState === '待排'"
+              link
+              type="warning"
+              size="small"
+              @click="handleConfirmReschedule(row)"
+            >
+              按新时段确认重排
+            </el-button>
+            <el-button v-if="row.scheduleState === '待排'" link type="primary" size="small" @click="openEdit(row)">
+              改时段重排
+            </el-button>
+            <template v-if="row.scheduleState === '挂起'">
+              <el-button link type="primary" size="small" @click="openEdit(row)">改期重排</el-button>
+              <el-button link type="success" size="small" @click="handleKeep(row)">确认维持</el-button>
+            </template>
+            <el-button v-if="row.scheduleState === '已排'" link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -406,17 +531,25 @@ function handleFilterChange(key: string, value: string): void {
           :description="conflict.message"
         />
         <el-alert
+          v-else-if="deviceConflict.conflict"
+          type="error"
+          show-icon
+          :closable="false"
+          title="落入设备检修 / 停窑窗口，无法提交"
+          :description="deviceConflict.message"
+        />
+        <el-alert
           v-else
           type="success"
           show-icon
           :closable="false"
-          title="窑位可用，可以提交"
+          title="窑位与设备时段均可用，可以提交"
           :description="`当前曲线段「${form.curveSeg}」理论时长 ${formDuration.segment}，该作品全流程退火 ${formDuration.total}。${formDuration.hint}`"
         />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" :disabled="conflict.conflict" @click="handleSubmit">
+        <el-button type="primary" :loading="submitting" :disabled="formBlocked" @click="handleSubmit">
           保存
         </el-button>
       </template>
@@ -455,6 +588,28 @@ function handleFilterChange(key: string, value: string): void {
 .cell-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.cell-note {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: #5b6b7a;
+}
+
+.cell-warn {
+  color: #c0392b;
+}
+
+:deep(.row-pending) {
+  background-color: #fff8f1 !important;
+}
+
+:deep(.row-held) {
+  background-color: #fdecec !important;
 }
 
 .slot-grid {
